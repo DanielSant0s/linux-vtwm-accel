@@ -82,6 +82,7 @@
  */
 
 /* Spansion */
+#define SPAN_SL004A		0x0212 /* 512 KB */
 #define SPAN_FL016A		0x0214 /* 2 MB */
 #define SPAN_FL064A		0x0216 /* 8 MB */
 
@@ -131,6 +132,7 @@ struct wmt_flash_id {
 };
 
 static struct wmt_flash_id flash_ids[] = {
+	{ SF_ID(MFR_SPANSION,	SPAN_SL004A),	512 },
 	{ SF_ID(MFR_SPANSION,	SPAN_FL016A),	2048 },
 	{ SF_ID(MFR_SPANSION,	SPAN_FL064A),	8192 },
 	{ SF_ID(MFR_EON,	EON_25P16),	2048 },
@@ -568,13 +570,11 @@ static int wmt_sf_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int wmt_sf_remove(struct platform_device *pdev)
+static void wmt_sf_remove(struct platform_device *pdev)
 {
 	struct wmt_sf_data *info = dev_get_drvdata(&pdev->dev);
 
 	mtd_device_unregister(info->sf_mtd);
-
-	return 0;
 }
 
 static const struct of_device_id wmt_dt_ids[] = {

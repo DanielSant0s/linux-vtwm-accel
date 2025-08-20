@@ -96,7 +96,7 @@ static inline int dt_parse_node(struct device_node *np)
 		dt_mux_phys_desc = "i8042/serio%d";
 
 	if (of_get_property(np, "init-reset", NULL))
-		i8042_reset = true;
+		i8042_reset = I8042_RESET_ALWAYS;
 
 	return 0;
 }
