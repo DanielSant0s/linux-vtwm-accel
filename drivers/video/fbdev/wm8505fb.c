@@ -37,9 +37,18 @@ struct wm8505fb_info {
 	struct fb_info		fb;
 	void __iomem		*regbase;
 	unsigned int		contrast;
+	wait_queue_head_t	vsync_wait;
 };
 
+static char *mode_option;
+module_param(mode_option, charp, 0);
+MODULE_PARM_DESC(mode_option, "Default video mode ('800x480-16@60')");
 
+static int vram_size_mb = 8;
+module_param(vram_size_mb, int, 0);
+MODULE_PARM_DESC(vram_size_mb, "VRAM size in MiB (default=8)");
+
+static int wm8505fb_init_hw(struct fb_info *info);
 static int wm8505fb_init_hw(struct fb_info *info)
 {
 	struct wm8505fb_info *fbi = to_wm8505fb_info(info);
@@ -230,6 +239,112 @@ static int wm8505fb_pan_display(struct fb_var_screeninfo *var,
 	return 0;
 }
 
+static irqreturn_t wm8505fb_irq(int irq, void *data)
+{
+	struct wm8505fb_info *fbi = data;
+
+	/* Check if it's our interrupt */
+	if (readl(fbi->regbase + WMT_GOVR_INT) & GOVRH_INT_MEM) {
+		writel(GOVRH_INT_MEM, fbi->regbase + WMT_GOVR_INT); /* Clear */
+		wake_up_interruptible(&fbi->vsync_wait);
+		return IRQ_HANDLED;
+	}
+
+	return IRQ_NONE;
+}
+
+static int wm8505fb_wait_for_vsync(struct fb_info *info)
+{
+	struct wm8505fb_info *fbi = to_wm8505fb_info(info);
+	int ret;
+
+	/* Enable VSync interrupt */
+	writel(GOVRH_INT_MEM_ENABLE, fbi->regbase + WMT_GOVR_INT);
+
+	ret = wait_event_interruptible_timeout(fbi->vsync_wait,
+		(readl(fbi->regbase + WMT_GOVR_INT) & GOVRH_INT_MEM), HZ / 10);
+
+	/* Disable after wait for one-shot behavior */
+	writel(0, fbi->regbase + WMT_GOVR_INT);
+
+	if (ret < 0)
+		return ret;
+	if (ret == 0)
+		return -ETIMEDOUT;
+
+	return 0;
+}
+
+static int wm8505fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
+{
+	unsigned int cmd_val;
+
+	switch (cmd) {
+	case FBIO_WAITFORVSYNC:
+		return wm8505fb_wait_for_vsync(info);
+	case GEIO_ROTATE:
+		if (copy_from_user(&cmd_val, (void __user *)arg, sizeof(cmd_val)))
+			return -EFAULT;
+		return wmt_ge_rotate(info, cmd_val);
+	case GEIO_ALPHA_BLEND:
+		if (copy_from_user(&cmd_val, (void __user *)arg, sizeof(cmd_val)))
+			return -EFAULT;
+		return wmt_ge_amx_set_alpha(info, cmd_val);
+	case GEIOSET_AMX_EN:
+		if (copy_from_user(&cmd_val, (void __user *)arg, sizeof(cmd_val)))
+			return -EFAULT;
+		return wmt_ge_amx_set_en(info, cmd_val);
+	case GEIO_ROP_ALPHA:
+		if (copy_from_user(&cmd_val, (void __user *)arg, sizeof(cmd_val)))
+			return -EFAULT;
+		return wmt_ge_rop_alpha_blend(info, cmd_val, 0);
+	case GEIO_FILLRECT:
+	{
+		struct ge_fillrect_user rect_user;
+		struct fb_fillrect rect_kernel;
+
+		if (copy_from_user(&rect_user, (void __user *)arg, sizeof(rect_user)))
+			return -EFAULT;
+
+		rect_kernel.dx = rect_user.dx;
+		rect_kernel.dy = rect_user.dy;
+		rect_kernel.width = rect_user.width;
+		rect_kernel.height = rect_user.height;
+		rect_kernel.color = rect_user.color;
+		rect_kernel.rop = rect_user.rop;
+
+		wmt_ge_fillrect(info, &rect_kernel);
+		return 0;
+	}
+	case GEIO_COPYAREA:
+	{
+		struct ge_copyarea_user area_user;
+		struct fb_copyarea area_kernel;
+
+		if (copy_from_user(&area_user, (void __user *)arg, sizeof(area_user)))
+			return -EFAULT;
+
+		area_kernel.dx = area_user.dx;
+		area_kernel.dy = area_user.dy;
+		area_kernel.sx = area_user.sx;
+		area_kernel.sy = area_user.sy;
+		area_kernel.width = area_user.width;
+		area_kernel.height = area_user.height;
+
+		wmt_ge_copyarea(info, &area_kernel);
+		return 0;
+	}
+	case GEIO_WAIT_SYNC:
+		return wmt_ge_sync(info);
+	case GEIOSET_COLORKEY:
+		if (copy_from_user(&cmd_val, (void __user *)arg, sizeof(cmd_val)))
+			return -EFAULT;
+		return wmt_ge_set_colorkey(info, cmd_val);
+	default:
+		return -ENOTTY;
+	}
+}
+
 static int wm8505fb_blank(int blank, struct fb_info *info)
 {
 	struct wm8505fb_info *fbi = to_wm8505fb_info(info);
@@ -255,6 +370,7 @@ static const struct fb_ops wm8505fb_ops = {
 	.fb_copyarea	= wmt_ge_copyarea,
 	.fb_imageblit	= sys_imageblit,
 	.fb_sync	= wmt_ge_sync,
+	.fb_ioctl	= wm8505fb_ioctl,
 	.fb_pan_display	= wm8505fb_pan_display,
 	.fb_blank	= wm8505fb_blank,
 	__FB_DEFAULT_IOMEM_OPS_MMAP,
@@ -265,7 +381,7 @@ static int wm8505fb_probe(struct platform_device *pdev)
 	struct wm8505fb_info	*fbi;
 	struct display_timings *disp_timing;
 	void			*addr;
-	int ret;
+	int ret, irq;
 
 	struct fb_videomode	mode;
 	u32			bpp;
@@ -303,6 +419,24 @@ static int wm8505fb_probe(struct platform_device *pdev)
 	if (IS_ERR(fbi->regbase))
 		return PTR_ERR(fbi->regbase);
 
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0) {
+		dev_err(&pdev->dev, "no irq resource found\n");
+		return irq;
+	}
+
+	init_waitqueue_head(&fbi->vsync_wait);
+
+	ret = devm_request_irq(&pdev->dev, irq, wm8505fb_irq, 0,
+			       DRIVER_NAME, fbi);
+	if (ret) {
+		dev_err(&pdev->dev, "failed to request irq\n");
+		return ret;
+	}
+
+	/* Disable all interrupts initially */
+	writel(0, fbi->regbase + WMT_GOVR_INT);
+
 	disp_timing = of_get_display_timings(pdev->dev.of_node);
 	if (!disp_timing)
 		return -EINVAL;
@@ -323,8 +457,16 @@ static int wm8505fb_probe(struct platform_device *pdev)
 	fbi->fb.var.height		= -1;
 	fbi->fb.var.width		= -1;
 
-	/* try allocating the framebuffer */
-	fb_mem_len = mode.xres * mode.yres * 2 * (bpp / 8);
+	/* Allocate VRAM (using fixed size from module param or default) */
+	/* Legacy drivers used large buffers (e.g. 8MB) to allow offscreen surfaces for GE */
+	fb_mem_len = vram_size_mb * 1024 * 1024;
+	
+	/* Ensure we have at least enough for the mode */
+	if (fb_mem_len < mode.xres * mode.yres * 4 * 2) /* Safety margin */
+		fb_mem_len = mode.xres * mode.yres * 4 * 2;
+
+	/* Ideally use dma_alloc_wc for write-combining if arch supports it, 
+	   but dmam_alloc_coherent is safer/standard for this platform bus context */
 	fb_mem_virt = dmam_alloc_coherent(&pdev->dev, fb_mem_len, &fb_mem_phys,
 				GFP_KERNEL);
 	if (!fb_mem_virt) {
@@ -355,6 +497,9 @@ static int wm8505fb_probe(struct platform_device *pdev)
 
 	wm8505fb_init_hw(&fbi->fb);
 
+	/* Initialize interrupts disabled (one-shot mode) */
+	writel(0, fbi->regbase + WMT_GOVR_INT);
+
 	platform_set_drvdata(pdev, fbi);
 
 	ret = register_framebuffer(&fbi->fb);
@@ -378,6 +523,9 @@ static void wm8505fb_remove(struct platform_device *pdev)
 	struct wm8505fb_info *fbi = platform_get_drvdata(pdev);
 
 	unregister_framebuffer(&fbi->fb);
+
+	/* Disable interrupts */
+	writel(0, fbi->regbase + WMT_GOVR_INT);
 
 	writel(0, fbi->regbase);
 

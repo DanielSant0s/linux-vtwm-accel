@@ -65,4 +65,13 @@
 #define WMT_GOVR_TIMING_V_SYNC	0x128
 #define WMT_GOVR_TIMING_H_SYNC	0x12c
 
+/*
+ * Interrupt enable, clear, status
+ */
+#define WMT_GOVR_INT		0x38
+#define GOVRH_INT_MEM		BIT(17)
+#define GOVRH_INT_CUR		BIT(16)
+#define GOVRH_INT_MEM_ENABLE	BIT(1)
+#define GOVRH_INT_CUR_ENABLE	BIT(0)
+
 #endif /* _WM8505FB_REGS_H */
