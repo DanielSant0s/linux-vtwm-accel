@@ -227,8 +227,6 @@ int wmt_ge_rotate(struct fb_info *p, int angle)
 }
 EXPORT_SYMBOL_GPL(wmt_ge_rotate);
 
-EXPORT_SYMBOL_GPL(wmt_ge_rotate);
-
 int wmt_ge_rop_alpha_blend(struct fb_info *p, int alpha, int mode)
 {
 	/* Simple constant alpha blend implementation */
