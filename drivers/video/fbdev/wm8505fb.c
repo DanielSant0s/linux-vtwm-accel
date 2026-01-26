@@ -258,6 +258,9 @@ static int wm8505fb_wait_for_vsync(struct fb_info *info)
 	struct wm8505fb_info *fbi = to_wm8505fb_info(info);
 	int ret;
 
+	/* Clear any pending VSync interrupt first to avoid immediate return */
+	writel(GOVRH_INT_MEM, fbi->regbase + WMT_GOVR_INT);
+
 	/* Enable VSync interrupt */
 	writel(GOVRH_INT_MEM_ENABLE, fbi->regbase + WMT_GOVR_INT);
 
@@ -310,10 +313,16 @@ static int wm8505fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long 
 		rect_kernel.dy = rect_user.dy;
 		rect_kernel.width = rect_user.width;
 		rect_kernel.height = rect_user.height;
+
+		/* 
+		 * Use direct RGB backend because rect_user.color is a raw pixel value,
+		 * not a palette index. The standard wmt_ge_fillrect expects an index
+		 * for TrueColor visuals (fbdev standard), which causes wrong colors here.
+		 */
 		rect_kernel.color = rect_user.color;
 		rect_kernel.rop = rect_user.rop;
 
-		wmt_ge_fillrect(info, &rect_kernel);
+		wmt_ge_fillrect_rgb(info, &rect_kernel, rect_user.color);
 		return 0;
 	}
 	case GEIO_COPYAREA:

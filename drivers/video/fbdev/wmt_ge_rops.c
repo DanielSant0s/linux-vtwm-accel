@@ -80,20 +80,15 @@
 
 static void __iomem *regbase;
 
-void wmt_ge_fillrect(struct fb_info *p, const struct fb_fillrect *rect)
+/* Internal helper for raw hardware fill - exported for IOCTL usage */
+void wmt_ge_fillrect_rgb(struct fb_info *p, const struct fb_fillrect *rect, u32 rgb_color)
 {
-	unsigned long fg, pat;
+	unsigned long pat;
 
 	if (p->state != FBINFO_STATE_RUNNING)
 		return;
 
-	if (p->fix.visual == FB_VISUAL_TRUECOLOR ||
-	    p->fix.visual == FB_VISUAL_DIRECTCOLOR)
-		fg = ((u32 *) (p->pseudo_palette))[rect->color];
-	else
-		fg = rect->color;
-
-	pat = pixel_to_pat(p->var.bits_per_pixel, fg);
+	pat = pixel_to_pat(p->var.bits_per_pixel, rgb_color);
 
 	if (p->fbops->fb_sync)
 		p->fbops->fb_sync(p);
@@ -113,6 +108,20 @@ void wmt_ge_fillrect(struct fb_info *p, const struct fb_fillrect *rect)
 	writel(1, regbase + GE_COMMAND_OFF);
 	writel(rect->rop == ROP_XOR ? 0x5a : 0xf0, regbase + GE_ROPCODE_OFF);
 	writel(1, regbase + GE_FIRE_OFF);
+}
+EXPORT_SYMBOL_GPL(wmt_ge_fillrect_rgb);
+
+void wmt_ge_fillrect(struct fb_info *p, const struct fb_fillrect *rect)
+{
+	unsigned long fg;
+
+	if (p->fix.visual == FB_VISUAL_TRUECOLOR ||
+	    p->fix.visual == FB_VISUAL_DIRECTCOLOR)
+		fg = ((u32 *) (p->pseudo_palette))[rect->color];
+	else
+		fg = rect->color;
+
+	wmt_ge_fillrect_rgb(p, rect, fg);
 }
 EXPORT_SYMBOL_GPL(wmt_ge_fillrect);
 
