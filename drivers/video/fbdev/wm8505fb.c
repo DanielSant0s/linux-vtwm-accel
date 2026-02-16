@@ -38,6 +38,7 @@ struct wm8505fb_info {
 	void __iomem		*regbase;
 	unsigned int		contrast;
 	wait_queue_head_t	vsync_wait;
+	unsigned int		vsync_count;	/* incremented by ISR */
 };
 
 static char *mode_option;
@@ -242,10 +243,23 @@ static int wm8505fb_pan_display(struct fb_var_screeninfo *var,
 static irqreturn_t wm8505fb_irq(int irq, void *data)
 {
 	struct wm8505fb_info *fbi = data;
+	u32 status = readl(fbi->regbase + WMT_GOVR_INT);
 
-	/* Check if it's our interrupt */
-	if (readl(fbi->regbase + WMT_GOVR_INT) & GOVRH_INT_MEM) {
-		writel(GOVRH_INT_MEM, fbi->regbase + WMT_GOVR_INT); /* Clear */
+	if (status & GOVRH_INT_MEM) {
+		/*
+		 * Clear the MEM status bit (W1C) while preserving the
+		 * enable bits in the lower half of the register.
+		 *
+		 * The legacy driver used 16-bit writes to the upper half
+		 * (govrh_clean_int_status: vppif_reg16_out(REG_GOVRH_INT+0x2, 0x2))
+		 * to avoid clobbering enable bits. We achieve the same by
+		 * masking: keep enables (bits 0-1), set the W1C status bit.
+		 * Writing 0 to other W1C bits is a no-op.
+		 */
+		writel((status & GOVRH_INT_ENABLE_MASK) | GOVRH_INT_MEM,
+		       fbi->regbase + WMT_GOVR_INT);
+
+		fbi->vsync_count++;
 		wake_up_interruptible(&fbi->vsync_wait);
 		return IRQ_HANDLED;
 	}
@@ -256,19 +270,59 @@ static irqreturn_t wm8505fb_irq(int irq, void *data)
 static int wm8505fb_wait_for_vsync(struct fb_info *info)
 {
 	struct wm8505fb_info *fbi = to_wm8505fb_info(info);
+	unsigned int count;
+	u32 reg;
 	int ret;
 
-	/* Clear any pending VSync interrupt first to avoid immediate return */
-	writel(GOVRH_INT_MEM, fbi->regbase + WMT_GOVR_INT);
+	/*
+	 * VSync wait implementation — matches the legacy driver approach:
+	 *
+	 * Legacy ge_main.c FBIO_WAITFORVSYNC called vpp_wait_vsync(),
+	 * which used interrupt-driven semaphores on VPP_INT_GOVRH_VBIS.
+	 *
+	 * Legacy ge_accel.c wait_vsync() polled VPP_INTSTS (0xd8050f04)
+	 * bit 2 (GOVW_VBIE) with msleep_interruptible(10).
+	 *
+	 * Our implementation uses the GOVRH local interrupt register (0x38)
+	 * with wait_event and a software counter to avoid the race condition
+	 * where the ISR clears the hardware status bit before wait_event
+	 * can observe it.
+	 *
+	 * Register layout of GOVRH_INT (offset 0x38):
+	 *   Bits 0-1:   Enable (normal R/W)
+	 *   Bits 16-17: Status (write-1-to-clear)
+	 *
+	 * The legacy driver used 16-bit writes to upper/lower halves to
+	 * avoid clobbering enable vs status fields. We use read-modify-write
+	 * with masking instead.
+	 */
 
-	/* Enable VSync interrupt */
-	writel(GOVRH_INT_MEM_ENABLE, fbi->regbase + WMT_GOVR_INT);
+	/* Snapshot the current vsync count before enabling the interrupt */
+	count = fbi->vsync_count;
 
+	/*
+	 * Clear any pending MEM status, then enable MEM interrupt.
+	 * Use a single write: preserve nothing (interrupts were disabled),
+	 * set enable bit + W1C status bit to clear any stale status.
+	 */
+	writel(GOVRH_INT_MEM_ENABLE | GOVRH_INT_MEM,
+	       fbi->regbase + WMT_GOVR_INT);
+
+	/*
+	 * Wait until the ISR increments vsync_count, meaning a frame
+	 * complete (VSync) event occurred. Timeout after 100ms (~6 frames
+	 * at 60Hz — generous to avoid false negatives).
+	 */
 	ret = wait_event_interruptible_timeout(fbi->vsync_wait,
-		(readl(fbi->regbase + WMT_GOVR_INT) & GOVRH_INT_MEM), HZ / 10);
+					       fbi->vsync_count != count,
+					       HZ / 10);
 
-	/* Disable after wait for one-shot behavior */
-	writel(0, fbi->regbase + WMT_GOVR_INT);
+	/*
+	 * Disable the interrupt (one-shot). Read-modify-write to keep
+	 * other bits undisturbed. Clear enables, don't touch status (W1C).
+	 */
+	reg = readl(fbi->regbase + WMT_GOVR_INT);
+	writel(reg & ~GOVRH_INT_ENABLE_MASK, fbi->regbase + WMT_GOVR_INT);
 
 	if (ret < 0)
 		return ret;
@@ -278,35 +332,114 @@ static int wm8505fb_wait_for_vsync(struct fb_info *info)
 	return 0;
 }
 
-static int wm8505fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
+static int wm8505fb_ioctl(struct fb_info *info, unsigned int cmd,
+			  unsigned long arg)
 {
 	unsigned int cmd_val;
 
 	switch (cmd) {
+
+	/* ---- Sync ---- */
 	case FBIO_WAITFORVSYNC:
 		return wm8505fb_wait_for_vsync(info);
+
+	case GEIO_WAIT_SYNC:
+		return wmt_ge_sync(info);
+
+	/* ---- Transform ---- */
 	case GEIO_ROTATE:
-		if (copy_from_user(&cmd_val, (void __user *)arg, sizeof(cmd_val)))
+		if (copy_from_user(&cmd_val, (void __user *)arg,
+				   sizeof(cmd_val)))
 			return -EFAULT;
 		return wmt_ge_rotate(info, cmd_val);
+
+	case GEIO_MIRROR:
+		if (copy_from_user(&cmd_val, (void __user *)arg,
+				   sizeof(cmd_val)))
+			return -EFAULT;
+		return wmt_ge_mirror(info, cmd_val);
+
+	/* ---- AMX layer alpha & enable ---- */
 	case GEIO_ALPHA_BLEND:
-		if (copy_from_user(&cmd_val, (void __user *)arg, sizeof(cmd_val)))
+		if (copy_from_user(&cmd_val, (void __user *)arg,
+				   sizeof(cmd_val)))
 			return -EFAULT;
 		return wmt_ge_amx_set_alpha(info, cmd_val);
+
 	case GEIOSET_AMX_EN:
-		if (copy_from_user(&cmd_val, (void __user *)arg, sizeof(cmd_val)))
+		if (copy_from_user(&cmd_val, (void __user *)arg,
+				   sizeof(cmd_val)))
 			return -EFAULT;
 		return wmt_ge_amx_set_en(info, cmd_val);
+
+	/* ---- Per-blit alpha ---- */
 	case GEIO_ROP_ALPHA:
-		if (copy_from_user(&cmd_val, (void __user *)arg, sizeof(cmd_val)))
+		if (copy_from_user(&cmd_val, (void __user *)arg,
+				   sizeof(cmd_val)))
 			return -EFAULT;
 		return wmt_ge_rop_alpha_blend(info, cmd_val, 0);
+
+	/* ---- Color keys ---- */
+	case GEIOSET_COLORKEY:
+		if (copy_from_user(&cmd_val, (void __user *)arg,
+				   sizeof(cmd_val)))
+			return -EFAULT;
+		return wmt_ge_set_colorkey(info, cmd_val);
+
+	case GEIO_SET_SRC_CK:
+		if (copy_from_user(&cmd_val, (void __user *)arg,
+				   sizeof(cmd_val)))
+			return -EFAULT;
+		return wmt_ge_set_src_colorkey(info, cmd_val);
+
+	case GEIO_SET_DST_CK:
+		if (copy_from_user(&cmd_val, (void __user *)arg,
+				   sizeof(cmd_val)))
+			return -EFAULT;
+		return wmt_ge_set_dst_colorkey(info, cmd_val);
+
+	/* ---- CSC (Color Space Conversion) ---- */
+	case GEIO_SET_CSC:
+		if (copy_from_user(&cmd_val, (void __user *)arg,
+				   sizeof(cmd_val)))
+			return -EFAULT;
+		return wmt_ge_set_csc(info, cmd_val);
+
+	/* ---- GE engine delay ---- */
+	case GEIO_SET_DELAY:
+		if (copy_from_user(&cmd_val, (void __user *)arg,
+				   sizeof(cmd_val)))
+			return -EFAULT;
+		return wmt_ge_set_delay(info, cmd_val);
+
+	/* ---- Chip ID (WM8650 = 0x3465) ---- */
+	case GEIOGET_CHIP_ID:
+	{
+		/*
+		 * Legacy BSP used PMC register 0xd8120000 to read chip ID.
+		 * For our device-tree based driver, return the known
+		 * WM8650 chip ID (0x3465).
+		 */
+		unsigned int chip_id = 0x3465;
+
+		if (copy_to_user((void __user *)arg, &chip_id,
+				 sizeof(chip_id)))
+			return -EFAULT;
+		return 0;
+	}
+
+	/* ---- Stop boot logo (legacy compat - no-op) ---- */
+	case GEIO_STOP_LOGO:
+		return 0;
+
+	/* ---- Fill rect (userspace IOCTL with raw RGB color) ---- */
 	case GEIO_FILLRECT:
 	{
 		struct ge_fillrect_user rect_user;
 		struct fb_fillrect rect_kernel;
 
-		if (copy_from_user(&rect_user, (void __user *)arg, sizeof(rect_user)))
+		if (copy_from_user(&rect_user, (void __user *)arg,
+				   sizeof(rect_user)))
 			return -EFAULT;
 
 		rect_kernel.dx = rect_user.dx;
@@ -314,10 +447,11 @@ static int wm8505fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long 
 		rect_kernel.width = rect_user.width;
 		rect_kernel.height = rect_user.height;
 
-		/* 
-		 * Use direct RGB backend because rect_user.color is a raw pixel value,
-		 * not a palette index. The standard wmt_ge_fillrect expects an index
-		 * for TrueColor visuals (fbdev standard), which causes wrong colors here.
+		/*
+		 * Use direct RGB backend because rect_user.color is a
+		 * raw pixel value, not a palette index. The standard
+		 * wmt_ge_fillrect expects an index for TrueColor visuals
+		 * (fbdev standard), which causes wrong colors from IOCTL.
 		 */
 		rect_kernel.color = rect_user.color;
 		rect_kernel.rop = rect_user.rop;
@@ -325,12 +459,15 @@ static int wm8505fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long 
 		wmt_ge_fillrect_rgb(info, &rect_kernel, rect_user.color);
 		return 0;
 	}
+
+	/* ---- Copy area ---- */
 	case GEIO_COPYAREA:
 	{
 		struct ge_copyarea_user area_user;
 		struct fb_copyarea area_kernel;
 
-		if (copy_from_user(&area_user, (void __user *)arg, sizeof(area_user)))
+		if (copy_from_user(&area_user, (void __user *)arg,
+				   sizeof(area_user)))
 			return -EFAULT;
 
 		area_kernel.dx = area_user.dx;
@@ -343,12 +480,45 @@ static int wm8505fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long 
 		wmt_ge_copyarea(info, &area_kernel);
 		return 0;
 	}
-	case GEIO_WAIT_SYNC:
-		return wmt_ge_sync(info);
-	case GEIOSET_COLORKEY:
-		if (copy_from_user(&cmd_val, (void __user *)arg, sizeof(cmd_val)))
+
+	/* ---- Line drawing ---- */
+	case GEIO_LINE:
+	{
+		struct ge_line_user line;
+
+		if (copy_from_user(&line, (void __user *)arg, sizeof(line)))
 			return -EFAULT;
-		return wmt_ge_set_colorkey(info, cmd_val);
+
+		return wmt_ge_draw_line(info, &line);
+	}
+
+	/* ---- Bezier curve ---- */
+	case GEIO_BEZIER:
+	{
+		struct ge_bezier_user bezier;
+
+		if (copy_from_user(&bezier, (void __user *)arg,
+				   sizeof(bezier)))
+			return -EFAULT;
+
+		return wmt_ge_draw_bezier(info, &bezier);
+	}
+
+	/* ---- General blit with alpha/colorkey ---- */
+	case GEIO_BLIT:
+	{
+		struct ge_blit_user blit;
+
+		if (copy_from_user(&blit, (void __user *)arg, sizeof(blit)))
+			return -EFAULT;
+
+		return wmt_ge_blit(info, &blit);
+	}
+
+	/* ---- Lock (legacy compat - serialize access, no-op here) ---- */
+	case GEIO_LOCK:
+		return 0;
+
 	default:
 		return -ENOTTY;
 	}

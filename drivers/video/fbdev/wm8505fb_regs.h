@@ -67,11 +67,25 @@
 
 /*
  * Interrupt enable, clear, status
+ *
+ * Register layout of GOVRH_INT (offset 0x38):
+ *   Bits 0-1:   Interrupt ENABLE (normal read/write)
+ *     BIT(0) = Cursor interrupt enable
+ *     BIT(1) = Memory (frame done) interrupt enable
+ *   Bits 16-17: Interrupt STATUS (write-1-to-clear)
+ *     BIT(16) = Cursor interrupt status
+ *     BIT(17) = Memory (frame done) interrupt status
+ *
+ * IMPORTANT: The legacy driver (govrh.c) used 16-bit writes to the
+ * upper/lower halves to avoid clobbering enable bits when clearing
+ * status bits (and vice versa). In our driver we use read-modify-write
+ * with GOVRH_INT_ENABLE_MASK to achieve the same.
  */
 #define WMT_GOVR_INT		0x38
-#define GOVRH_INT_MEM		BIT(17)
-#define GOVRH_INT_CUR		BIT(16)
-#define GOVRH_INT_MEM_ENABLE	BIT(1)
-#define GOVRH_INT_CUR_ENABLE	BIT(0)
+#define GOVRH_INT_MEM		BIT(17)	/* MEM status (W1C) */
+#define GOVRH_INT_CUR		BIT(16)	/* CUR status (W1C) */
+#define GOVRH_INT_MEM_ENABLE	BIT(1)	/* MEM enable (R/W) */
+#define GOVRH_INT_CUR_ENABLE	BIT(0)	/* CUR enable (R/W) */
+#define GOVRH_INT_ENABLE_MASK	(GOVRH_INT_MEM_ENABLE | GOVRH_INT_CUR_ENABLE)
 
 #endif /* _WM8505FB_REGS_H */
